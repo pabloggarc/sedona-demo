@@ -1,0 +1,62 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    command: /data
+    ports:
+      - "9001:9001"
+    env_file: rustfs/rustfs.env
+    volumes:
+      - rustfs-data:/data
+
+  rustfs-init:
+    image: rustfs/rc:v0.1.36
+    entrypoint: ["sh", "/create-bucket.sh"]
+    depends_on:
+      - rustfs
+    env_file: rustfs/rustfs-init.env
+    volumes:
+      - ./rustfs/create-bucket.sh:/create-bucket.sh:ro
+
+  metastore:
+    image: sedona-demo/hive-metastore:3.1.3
+    build: ./metastore
+    platform: linux/amd64
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    env_file: metastore/metastore.env
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  trino:
+    image: trinodb/trino:483
+    depends_on:
+      metastore:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    env_file: trino/trino.env
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    mem_limit: 4g
+
+  spark:
+    image: sedona-demo/spark:4.1.3-sedona-1.9.1
+    build: ./spark
+    depends_on:
+      metastore:
+        condition: service_healthy
+    ports:
+      - "4040:4040"
+    env_file: spark/spark.env
+    volumes:
+      - ./jobs:/home/spark/jobs
+      - ./sql:/home/spark/sql
+      - ./data:/home/spark/data
+
+volumes:
+  rustfs-data:
