@@ -10,3 +10,13 @@ __pycache__/
 
 .env
 .DS_Store
+
+# Terraform state and providers
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# sbt
+target/
+.bsp/
+runs/

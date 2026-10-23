@@ -58,5 +58,15 @@ services:
       - ./sql:/home/spark/sql
       - ./data:/home/spark/data
 
+  spark-history:
+    image: sedona-demo/spark:4.1.3-sedona-1.9.1
+    build: ./spark
+    command: spark-class org.apache.spark.deploy.history.HistoryServer
+    ports:
+      - "18080:18080"
+    env_file: spark-history/spark-history.env
+    volumes:
+      - ../cloud-batch/runs/events:/events:ro
+
 volumes:
   rustfs-data:

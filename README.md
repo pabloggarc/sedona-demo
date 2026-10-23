@@ -5,17 +5,26 @@
     <td align="center" width="110"><img src="docs/images/spark.png" height="56" alt="Apache Spark"><br><sub>Spark</sub></td>
     <td align="center" width="110"><img src="docs/images/sedona.png" height="56" alt="Apache Sedona"><br><sub>Sedona</sub></td>
     <td align="center" width="110"><img src="docs/images/iceberg.png" height="56" alt="Apache Iceberg"><br><sub>Iceberg</sub></td>
-    <td align="center" width="110"><img src="docs/images/hive.svg" height="56" alt="Apache Hive"><br><sub>Hive</sub></td>
+    <td align="center" width="110"><img src="docs/images/hive.svg" height="56" alt="Apache Hive"><br><sub>Hive Metastore</sub></td>
     <td align="center" width="110"><img src="docs/images/trino.png" height="56" alt="Trino"><br><sub>Trino</sub></td>
-    <td align="center" width="110"><img src="docs/images/s3.svg" height="56" alt="Amazon S3"><br><sub>S3 / RustFS</sub></td>
+    <td align="center" width="110"><img src="docs/images/rustfs.png" height="56" alt="RustFS"><br><sub>RustFS</sub></td>
+  </tr>
+</table>
+<table align="center">
+  <tr>
+    <td align="center" width="110"><img src="docs/images/emr.svg" height="56" alt="Amazon EMR"><br><sub>EMR</sub></td>
+    <td align="center" width="110"><img src="docs/images/glue.svg" height="56" alt="AWS Glue"><br><sub>Glue Data Catalog</sub></td>
+    <td align="center" width="110"><img src="docs/images/athena.svg" height="56" alt="Amazon Athena"><br><sub>Athena</sub></td>
+    <td align="center" width="110"><img src="docs/images/s3.svg" height="56" alt="Amazon S3"><br><sub>S3</sub></td>
   </tr>
 </table>
 
 A demo of what [Apache Sedona](https://sedona.apache.org), the spatial extension of Apache Spark,
 brings to a lakehouse with Apache Iceberg tables, in two parts. The first one runs on a laptop with
 Docker Compose, on a slice of the data, so that every step can be followed and every job exists in
-Python, R and Scala. The second one runs the same spatial join on AWS over the whole planet, about
-3,200 million observations of species against 555,000 municipalities, a size no single machine can
+Python, R and Scala. The second one runs the same spatial join on Amazon EMR, straight from the
+public buckets of the data on S3, first for a whole country and then for the whole planet: about
+2,900 million observations of species against 555,000 municipalities, a size no single machine can
 handle.
 
 ## The problem
@@ -51,10 +60,11 @@ files as they were downloaded, as external tables. Silver turns them into Iceber
 and with the same conventions for the spatial part. Gold holds the results of the spatial joins.
 Trino can query every layer with SQL, and has its own spatial functions.
 
-**The cloud part** runs the spatial join for the whole planet on Amazon EMR, reading GBIF and
-Overture straight from their public buckets on S3. There the municipalities no longer fit in the
-memory of a single machine, so Sedona has to partition both sides by location across the cluster.
-It is [work in progress](#the-cloud-part).
+**The cloud part** runs the spatial join on Amazon EMR, reading GBIF and Overture straight from
+their public buckets on S3, with the infrastructure in Terraform and the job in Scala. The polygons
+no longer fit in the memory of every executor, so Sedona partitions both sides by location across
+the cluster. A whole country works today: Spain, 73 million observations against 8,655 polygons, in
+under four minutes. The whole planet is [what comes next](#next-the-whole-planet).
 
 The setup favors being easy to read over being realistic, and it is not meant for production.
 [This is not a production setup](#this-is-not-a-production-setup) explains what would change.
@@ -115,6 +125,45 @@ The local part runs entirely on Docker Compose, with RustFS standing in for S3.
 | **Hive Metastore** | The catalog for every layer, the external tables of bronze and the Iceberg tables, the same way Glue would be on AWS. |
 | **RustFS** | S3-compatible storage for the whole lakehouse. |
 | **Trino** | Queries the tables with SQL from outside Spark. Amazon Athena is built on it. |
+
+The cloud part keeps the same idea on AWS, with S3 and the Glue Data Catalog in the place of RustFS
+and the metastore. It skips the copy into bronze: its bronze tables are external tables over the
+public buckets of GBIF and Overture.
+
+```
+  ┌─────────────────────────────────┐        ┌─────────────────────────────────┐
+  │ s3://gbif-open-data-us-east-1   │        │ s3://overturemaps-us-west-2     │
+  │ GBIF snapshot, 288 GB Parquet   │        │ Overture divisions, GeoParquet  │
+  └────────────────┬────────────────┘        └────────────────┬────────────────┘
+                   │      bronze: external tables in Glue      │
+                   ▼                                           ▼
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ Amazon EMR, in a VPC with one public subnet                                  │
+  │                                                                              │
+  │   primary   m7g.xlarge, on demand      YARN, HDFS and the Spark driver       │
+  │   core      1 x c7g.4xlarge, on demand ┐ Spark executors, one task          │
+  │   task      3 x c7g.4xlarge, spot      ┘ per physical core                   │
+  └───────────────────────────────────────┬──────────────────────────────────────┘
+                                          │ obs_municipality (Iceberg)
+                                          ▼
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ s3://<account>-spatial-lakehouse                                             │
+  │                                                                              │
+  │   data/gold/    the results, as Iceberg tables in the Glue Data Catalog      │
+  │   code/jars/    the jar of the Scala job                                     │
+  │   temp/         Athena results, EMR logs and Spark event logs, which expire  │
+  └───────────────────────────────────────┬──────────────────────────────────────┘
+                                          │ SQL
+                              Amazon Athena (workgroup geospatial-lakehouse)
+```
+
+| Component | Role |
+|---|---|
+| **Amazon EMR** | Runs Spark with Sedona on a cluster that lives only for the run. |
+| **Glue Data Catalog** | The catalog of the three layers, the same role the Hive Metastore has in the local part. |
+| **S3** | The lakehouse bucket, plus the public buckets the data is read from. |
+| **Athena** | Queries the tables with SQL once the cluster is gone, as Trino does locally. |
+| **Terraform** | Creates all of the above, with one file per service in `cloud-batch/terraform`. |
 
 ### How geometries are stored
 
@@ -185,9 +234,28 @@ Only the ports that are useful for poking around are published.
 | Trino web UI | http://localhost:8080 | any user name |
 | RustFS console | http://localhost:9001/rustfs/console/ | `rustfsadmin` / `rustfsadmin` |
 | Spark UI | http://localhost:4040, while a job or shell started with `--service-ports` runs | none |
+| Spark History Server | http://localhost:18080, with the runs saved from EMR | none |
 
 The RustFS credentials live in `.env`, next to the GBIF account. The S3 API of RustFS and the
 Hive Metastore are only reachable from inside the Docker network.
+
+### On AWS
+
+The cloud part needs an AWS account, Terraform 1.9 or later, the AWS CLI and Docker, which builds
+the jar so you do not need a JDK or sbt. It runs in `us-east-1`, where GBIF keeps its copy, and a
+run for one country costs around two dollars.
+
+```bash
+cd sedona-demo/cloud-batch
+./scripts/build.sh                                      # the jar of the Scala job
+terraform -chdir=terraform init
+terraform -chdir=terraform apply                        # about 10 minutes, mostly the cluster
+./scripts/submit.sh sedonademo.ObsMunicipality ES       # any country code, or world
+./scripts/save-run.sh                                   # keeps the Spark event logs of the run
+terraform -chdir=terraform destroy
+```
+
+[The cloud part](#the-cloud-part) goes through each step.
 
 ## Walkthrough
 
@@ -365,22 +433,154 @@ docker compose run --rm --service-ports spark spark-shell -i jobs/scala/lakehous
 ## The cloud part
 
 The local part proves the pipeline on 3.6 million points. The cloud part takes the spatial join to
-the size where it stops being possible on one machine.
+the size where it stops being possible on one machine. It lives in `cloud-batch/`, and only covers
+the observations per municipality, which is the join that grows with the data.
 
 | | Local | Cloud |
 |---|---|---|
-| Observations | 3.6 million (Castilla-La Mancha) | about 3,200 million (the whole GBIF snapshot on S3, 288 GB) |
-| Municipalities | 926 | 555,000, in 229 countries |
+| Observations | 3.6 million (Castilla-La Mancha) | 2,874 million records in the GBIF snapshot on S3 (288 GB), 73 million of them in Spain |
+| Municipalities | 926 | 8,655 in Spain, about 555,000 in the world |
 | Spatial join | `BroadcastIndexJoin`, the polygons fit in memory | `RangeJoin`, both sides partitioned by location |
-| Compute | Spark in local mode on a laptop | Amazon EMR |
+| Compute | Spark in local mode on a laptop | Amazon EMR, 64 Graviton cores |
 | Storage and catalog | RustFS and a Hive Metastore | S3 and the Glue Data Catalog, with external tables over the public buckets |
+| Language | Python, R and Scala | Scala, as a jar submitted to EMR |
 
-Checking every point against every municipality would mean about 1.75 × 10¹⁵ point-in-polygon
-tests. With Sedona's spatial index, each point is only checked against the few polygons around
-it. The plan is to run it on a cluster of around 20 nodes with Spot instances, which should take
-well under two hours and cost in the order of ten dollars, and to launch it from R as well.
+Checking every point against every municipality of the world would mean about
 
-This part is being built now, and it will live in a `cloud-batch/` folder next to `local-batch/`.
+$$2.9 \times 10^9 \times 5.55 \times 10^5 \approx 1.6 \times 10^{15}$$
+
+point-in-polygon tests. With Sedona's partitioning and index, each point is only checked against
+the one or two pieces of polygon around it.
+
+### Running it
+
+Run the steps from `cloud-batch/`, with credentials for your AWS account in the environment.
+
+[`scripts/build.sh`](cloud-batch/scripts/build.sh) compiles the sbt project in
+[`jobs/`](cloud-batch/jobs) inside a Docker image with Java and sbt, and leaves the jar in
+`jobs/target/sedona-jobs.jar`. Spark and Sedona are marked as provided, since the cluster brings
+them, so the jar only holds the classes of the job.
+
+`terraform apply` creates the whole stack, with one file per service in
+[`terraform/`](cloud-batch/terraform):
+
+- A VPC with one public subnet and a gateway endpoint for S3, so the cluster reads the data
+  without going through the internet.
+- The lakehouse bucket, split into `data/`, `code/` and `temp/`. Everything under `temp/` expires
+  after 15 or 30 days.
+- The `bronze`, `silver` and `gold` databases in Glue. Bronze holds external tables over the
+  public buckets, with every column declared, and gold the Iceberg table of the results.
+- An Athena workgroup that keeps its results under `temp/athena/` and stops any query that would
+  scan more than 10 GB.
+- An IAM role for the EMR service and another one for the nodes, which can only touch the
+  lakehouse bucket, the two public buckets and the Glue catalog.
+- The EMR cluster, with Spark configured for Sedona, Iceberg and Glue. The task nodes are spot
+  instances, and Terraform reads their on-demand price from the AWS Pricing API to use it as the
+  highest price to pay. The cluster terminates itself after 30 minutes without work.
+
+[`scripts/submit.sh`](cloud-batch/scripts/submit.sh) uploads the jar to `code/jars/` and adds a
+step to the cluster that runs `spark-submit` with the class and its arguments. The only argument
+of the job is the scope, a country code such as `ES` or `world`. The driver runs on the primary
+node, so its output ends up in the log of the step, under `temp/logs/<cluster>/steps/`.
+
+When the step is done, the results can be queried from Athena, in the `geospatial-lakehouse`
+workgroup:
+
+```sql
+SELECT name, region, observations, species
+FROM gold.obs_municipality
+WHERE scope = 'es'
+ORDER BY species DESC
+LIMIT 5;
+```
+
+`terraform destroy` removes everything, the bucket and its contents included, so run
+[`scripts/save-run.sh`](cloud-batch/scripts/save-run.sh) before if you want to look at the run
+later. Terminating the cluster from the console also stops the costs, and the next
+`terraform apply` creates a new one.
+
+### The job
+
+[`ObsMunicipality.scala`](cloud-batch/jobs/src/main/scala/sedonademo/ObsMunicipality.scala) does
+the same as `silver_gold_municip` in the local part, but straight from the bronze tables. It keeps
+records of presence, identified down to species and placed within 1 km, turns the coordinates into
+points and the WKB of Overture into polygons, joins them with `ST_Contains`, and counts
+observations and distinct species per municipality. Only the id of the municipality goes through
+the spatial join. The name, the region and the outline come back afterwards with a plain join,
+instead of being dragged through the partitioning. The result replaces the rows of its scope in
+`gold.obs_municipality`, so a country can be run again without touching the others.
+
+The cloud part only has this job in Scala, to keep it simple: a single jar that EMR runs as a step,
+with nothing to install on the cluster. The same job could be written in Python or R, like the jobs
+of the local part, by installing their packages on the nodes when the cluster starts.
+
+Two details decide how fast it is.
+
+**Which side draws the grid.** A `RangeJoin` splits the map into cells from a sample of one side of
+the join, the left one by default, so that every cell holds about the same number of its
+elements. Then every cell builds an R-tree, also over the left side, and checks the other side
+against it. The job keeps the polygons on the left, so they are the ones indexed, and sets
+`spark.sedona.join.spatitionside` to `right`, so the cells follow where the observations are. Drawn
+from the polygons, the cells would follow where the municipalities are instead, and the few with
+most of the observations would take far longer than the rest.
+
+**Cutting the polygons.** To check whether a point is inside a polygon, the `RangeJoin` uses the
+plain `contains` of JTS, which walks the whole outline (the broadcast join prepares the polygons
+first, this one does not). Some coastal localities have tens of thousands of vertices, 77,866 in
+the case of Alt Empordà. `ST_SubDivideExplode` cuts every polygon into pieces of 256 vertices at
+most, each one keeping the id of its municipality, so Spain goes from 8,655 polygons to 30,877
+pieces. A point that falls exactly on one of the cuts belongs to no piece, which with real
+coordinates does not happen in practice.
+
+### A whole country: Spain
+
+| | |
+|---|---|
+| Records read from GBIF | 2,874 million, the whole snapshot |
+| Observations after the filters | 72.9 million, 70.6 million of them with coordinates |
+| Polygons | 8,655 localities, cut into 30,877 pieces |
+| Cells of the join | 3,499, with about 20,000 points and 17 pieces each |
+| Spatial join | 46 seconds, the median task 0.7 s and the slowest 16.7 s |
+| Whole step | 3 minutes and 38 seconds |
+| Result | 8,528 rows, 51 MB in 25 Parquet files |
+
+GBIF is read three times in every run. Sedona goes through the points once to count them and find
+their bounds, once to take the sample of the grid, and once to send each point to its cell, and
+nothing keeps them in between. Filtering by country does not save any reading either, because the
+snapshot is not sorted by country, so reading costs the same for Spain as for the whole planet.
+
+### Looking at a run afterwards
+
+The Spark UI dies with the cluster, but it can be rebuilt from the event logs that Spark writes as
+it goes. `save-run.sh` copies them from the HDFS of the cluster to the bucket and then to
+`runs/events/`, and the logs of EMR to `runs/logs/<cluster>/`. The `spark-history` service of the
+local part opens every run in `runs/events/`:
+
+```bash
+cd ../local-batch
+docker compose up -d spark-history                      # http://localhost:18080
+```
+
+Its SQL tab shows the plan with the rows that went through each step, the Stages tab how long every
+task took, and the Jobs tab the three reads of GBIF, under the names `aggregate at
+SpatialRDD.java`, `collect at SpatialRDD.java` and `flatMapToPair at SpatialRDD.java`.
+
+### Next: the whole planet
+
+The planet has between 30 and 40 times more observations than Spain, depending on how many pass
+the filters, and about 60 times more polygons. Before running it, these are the changes I expect
+to make:
+
+- **A bigger limit for the sample.** Sedona brings 1% of the points to the driver to draw the grid,
+  around 30 MB for Spain but about 1 GB for the planet, which is the default
+  `spark.driver.maxResultSize`. It needs a higher limit and a primary node with more memory.
+- **More cells.** The number of cells comes from the number of files read on the side that draws
+  the grid, so the planet would get the same 3,500 cells as Spain, each with far more points.
+  `spark.sedona.join.numpartition` sets it by hand.
+- **More nodes.** At the speed of Spain, 64 cores would need around half an hour for the join.
+  Twice the nodes take half the time for about the same money.
+- **One read less.** `spark.sedona.join.approxcount` and `spark.sedona.join.boundary` give Sedona
+  the count and the bounds of the points, so it can skip the first read of GBIF.
 
 ## The data
 
@@ -389,6 +589,11 @@ This part is being built now, and it will live in a `cloud-batch/` folder next t
 | [GBIF](https://www.gbif.org) | Occurrences of species, from museums, herbaria and citizen science apps | 3,635,163 records in Castilla-La Mancha | Parquet | CC0, CC BY or CC BY-NC, depending on the dataset |
 | [Overture Maps](https://overturemaps.org), divisions | Administrative areas, from countries to neighborhoods | 4,557 areas in the bounding box, 926 municipalities of Castilla-La Mancha | GeoParquet | ODbL |
 | [Copernicus DEM](https://registry.opendata.aws/copernicus-dem/) GLO-30 | Elevation of the ground every 30 m | 24 tiles of 1x1 degree | Cloud Optimized GeoTIFF | Free for any use, with attribution |
+
+The cloud part reads the monthly snapshot of GBIF from `s3://gbif-open-data-us-east-1`, which only
+holds the records under CC0 and CC BY, and the release of Overture from
+`s3://overturemaps-us-west-2`. The versions are set by `gbif_snapshot` and `overture_release` in
+the Terraform variables, since Overture only keeps its latest releases.
 
 Overture and the DEM are read from their public buckets on AWS, and the download needs no AWS
 account. If you show results built on the GBIF records, cite the DOI of your download, as asked in
@@ -414,6 +619,15 @@ To use another region, change the bounding box and the GADM id of the region at 
 | RustFS | 1.0.1 | `rustfs/rustfs:1.0.1` |
 | R packages | sparklyr 1.9.6, dplyr, dbplyr 2.6.0 | binaries from Posit Package Manager, snapshot of 2026-10-15 |
 
+The cloud part uses what EMR ships, plus Sedona from Maven Central when the cluster starts.
+
+| Component | Version |
+|---|---|
+| Amazon EMR | `emr-spark-8.1.0`, with Spark 4.1.1 and Scala 2.13 |
+| Apache Sedona | 1.9.1, `sedona-spark-shaded-4.1_2.13` and `geotools-wrapper` |
+| Terraform | 1.9 or later, with the AWS provider 6.68 |
+| sbt | 1.11.7, in the `sbtscala/scala-sbt` image |
+
 **Spark 4.1.** It is the only Spark version Iceberg supports geometry types with, according to the
 [Iceberg 1.12.0 release notes](https://iceberg.apache.org/blog/apache-iceberg-1.12.0-release/),
 and the Spark version of the long-term support release of Amazon EMR.
@@ -434,13 +648,18 @@ Apple Silicon it runs emulated.
 needed anyway: `spark-defaults.conf` registers Sedona in every session, and dbplyr passes the
 spatial functions straight to Spark SQL.
 
+**Graviton instances.** On `c7g` every vCPU is a physical core, while on the Intel instances two
+vCPU share one, and a spatial join is all CPU. They were also the cheapest on spot when this was
+written, between 50% and 70% off, and the ones AWS takes back the least, under 5% a month against
+more than 20% for the newer `c8g` and `c7i`.
+
 **Trino 483, not 484.** 484 came out the day Trino was added to the demo, so the previous release
 felt like the safer choice.
 
 ## Known limitations
 
-These are limits of the versions above, not of the demo setup. I checked each of them against the
-code or reproduced it.
+These are limits of the versions and the data above, not of the demo setup. I checked each of them
+against the code or reproduced it.
 
 - **No native geometry columns in Iceberg.** Sedona 1.9 represents geometries with its own Spark
   type, and Iceberg's Spark connector only maps Spark 4.1's native `GEOMETRY` type, so writing a
@@ -461,6 +680,22 @@ code or reproduced it.
 - **MERGE from a temporary view over Iceberg tables fails** in Spark 4.1 with
   `No plan for TableReference`. It only affects R, where the source of the MERGE is a view, and
   `dplyr::compute()` works around it by caching the source first.
+- **Overture mixes levels under `locality`.** In Spain the subtype holds municipalities, but also
+  comarcas that group several of them and some units below the municipality, with nothing in the
+  data that tells them apart. 361 of the 8,655 localities contain others, so an observation in
+  Figueres counts for Figueres and for Alt Empordà, and the observations of the result add up to
+  more than the points that went in. The comarcas are also the first rows when sorting by
+  observations.
+- **The `RangeJoin` has no metrics.** Its box in the SQL tab of the Spark UI stays empty, so the
+  number of pairs that come out of the join is only visible in the result.
+- **Terraform cannot turn on two features of EMR yet**: sending the logs to CloudWatch, which would
+  show the driver and the executors while they run
+  ([hashicorp/terraform-provider-aws#49317](https://github.com/hashicorp/terraform-provider-aws/issues/49317)),
+  and Spark Connect sessions
+  ([hashicorp/terraform-provider-aws#50090](https://github.com/hashicorp/terraform-provider-aws/issues/50090)).
+- **The list columns of GBIF need an odd type in Glue.** The Parquet files use the old Hive layout
+  for lists, which Athena reads as `array<struct<array_element:string>>` and not as the
+  `array<string>` the GBIF documentation gives.
 - **Trino cannot read `bronze.overture_division_area`.** It is registered as GeoParquet, a format
   only Spark with Sedona understands. The GBIF table, in plain Parquet, it reads fine.
 
@@ -478,17 +713,26 @@ Everything here is tuned so that a laptop can run it and a person can follow it.
   `docker compose down -v` removes the files too.
 - **No security.** There is no TLS and no authentication between the services, and the RustFS
   credentials are the same for everything.
+- **A cluster per run.** The EMR cluster lives in a public subnet of a single availability zone
+  and is meant to be destroyed after each run, together with the bucket and everything in it.
 
 ## Repository layout
 
-Each folder of `local-batch/` holds everything its containers need. `scripts/` holds what you run
-from your own machine.
+Each folder of `local-batch/` holds everything its containers need. In both parts, `scripts/` holds
+what you run from your own machine.
 
 ```
 .
 ├── README.md
 ├── docs/images/              logos used in this README
-├── cloud-batch/              the cloud part, coming next
+├── cloud-batch/
+│   ├── terraform/            VPC, bucket, Glue, Athena, IAM and the EMR cluster, one file per service
+│   ├── jobs/                 sbt project with the Scala job, ObsMunicipality
+│   ├── scripts/
+│   │   ├── build.sh          builds the jar inside Docker
+│   │   ├── submit.sh         uploads the jar and runs one of its classes as an EMR step
+│   │   └── save-run.sh       downloads the Spark event logs and the EMR logs of a run
+│   └── runs/                 the saved runs, not committed
 └── local-batch/
     ├── docker-compose.yml    services, ports, volumes, dependencies
     ├── .env.example          GBIF account and RustFS credentials, copied to .env
@@ -496,6 +740,7 @@ from your own machine.
     ├── metastore/            Hive Metastore image with S3A, and its core-site.xml
     ├── spark/                Spark image (Sedona, Iceberg, S3A, R), spark-defaults.conf, logging
     ├── trino/                Trino catalogs for Iceberg and Hive
+    ├── spark-history/        settings of the history server that opens cloud-batch/runs
     ├── sql/lakehouse.sql     databases and external tables of bronze
     ├── scripts/
     │   ├── download-data.sh  downloads the slice of every source into data/raw
@@ -516,10 +761,13 @@ These are the settings you are most likely to play with.
 | Lookback window of silver | `LOOKBACK_DAYS` in `bronze_to_silver` | 365 days |
 | Size of the raster pieces | `RS_TileExplode` in `silver_gold_terrain` | 512 x 512 pixels |
 | Spark memory | `spark.driver.memory` in [`spark-defaults.conf`](local-batch/spark/spark-defaults.conf), and `connect()` in [`jobs/r/lakehouse.R`](local-batch/jobs/r/lakehouse.R) | 6 GB |
+| Size of the EMR cluster | `primary_instance_type`, `worker_instance_type`, `core_count` and `task_count` in [`variables.tf`](cloud-batch/terraform/variables.tf) | `m7g.xlarge`, and 1 + 3 `c7g.4xlarge` |
+| Spot or on demand | `task_on_spot` in `variables.tf` | spot |
+| Size of the polygon pieces | `ST_SubDivideExplode` in `ObsMunicipality.scala` | 256 vertices |
 
 ## Troubleshooting
 
-**A port is already in use.** The demo needs 4040, 8080 and 9001 on the host.
+**A port is already in use.** The demo needs 4040, 8080, 9001 and 18080 on the host.
 
 **A job dies with `OutOfMemoryError`.** Give Docker more memory, or stop Trino while the job runs
 with `docker compose stop trino`. From R, keep the driver memory in `connect()`, because in local
@@ -532,6 +780,20 @@ first, and only then asks GBIF for the occurrences.
 two different partition schemes, for example after changing them. Start from scratch with
 `docker compose down -v` and run `load-bronze.sh` again.
 
+**The EMR cluster stops with `VALIDATION_ERROR: Service role ... has insufficient EC2 permissions`.**
+The managed policy of the EMR service only lets it create instances tagged with
+`for-use-with-amazon-emr-managed-policies = true`, and EMR copies that tag from the cluster, so
+check that it is still in the tags of the cluster, the subnet and the security groups. CloudTrail
+shows the exact call that was denied. Right after the IAM roles are created the same error can also
+come from IAM taking a few seconds to spread, and running `apply` again solves it.
+
+**The task nodes never start.** There may be no spot capacity of that type at the time. Set
+`task_on_spot` to `false` and run `terraform apply` again.
+
+**The Spark History Server of the EMR console fails while a job runs.** It reads the event log
+while the driver is still writing it. The log of the step in S3, updated every few minutes, and the
+history server once the job is done are more reliable.
+
 **The metastore is slow to start on a Mac.** It runs under amd64 emulation. Make sure Rosetta is
 enabled in Docker Desktop (Settings → General → "Use Rosetta for x86_64/amd64 emulation").
 
@@ -541,6 +803,9 @@ enabled in Docker Desktop (Settings → General → "Use Rosetta for x86_64/amd6
 docker compose stop       # pause, keeping the state (resume with: docker compose start)
 docker compose down -v    # remove everything, including the lakehouse in RustFS
 ```
+
+In the cloud part, `terraform -chdir=terraform destroy` removes the cluster, the bucket and
+everything else it created.
 
 ## Contributing
 
@@ -570,5 +835,7 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 <sub>Apache Spark, Apache Sedona, Apache Iceberg, Apache Hive and their logos are trademarks of the
 [Apache Software Foundation](https://www.apache.org/foundation/marks/). Trino and its logo belong to
-the Trino Software Foundation, and Amazon S3 is a trademark of Amazon.com, Inc. They are used here
-only to identify each project. The demo uses RustFS, an S3-compatible store, not Amazon S3.</sub>
+the Trino Software Foundation, and RustFS and its logo to their owners. Amazon EMR, AWS Glue, Amazon
+Athena, Amazon S3 and their icons, taken from the
+[AWS Architecture Icons](https://aws.amazon.com/architecture/icons/), are trademarks of
+Amazon.com, Inc. They are used here only to identify each project or service.</sub>
