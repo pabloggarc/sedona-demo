@@ -1,6 +1,6 @@
-# Downloaded by local-batch/scripts/download-data.sh
-local-batch/data/*
-!local-batch/data/.gitkeep
+# Downloaded by local/scripts/download-data.sh
+local/data/*
+!local/data/.gitkeep
 
 # Python / Jupyter
 __pycache__/

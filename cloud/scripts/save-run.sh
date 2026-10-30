@@ -2,7 +2,7 @@
 #
 # Spark keeps its event logs in the HDFS of the cluster, so they are gone after a destroy. This
 # copies them to the bucket and downloads them into runs/events, where the spark-history service of
-# local-batch opens them, and the EMR logs into runs/logs/<cluster>. Run it before a destroy.
+# the local part opens them, and the EMR logs into runs/logs/<cluster>. Run it before a destroy.
 #
 #   ./scripts/save-run.sh
 

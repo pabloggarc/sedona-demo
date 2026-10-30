@@ -1,3 +1,5 @@
+name: sedona-demo
+
 services:
   rustfs:
     image: rustfs/rustfs:1.0.1
@@ -66,7 +68,7 @@ services:
       - "18080:18080"
     env_file: spark-history/spark-history.env
     volumes:
-      - ../cloud-batch/runs/events:/events:ro
+      - ../cloud/runs/events:/events:ro
 
 volumes:
   rustfs-data:

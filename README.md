@@ -20,12 +20,11 @@
 </table>
 
 A demo of what [Apache Sedona](https://sedona.apache.org), the spatial extension of Apache Spark,
-brings to a lakehouse with Apache Iceberg tables, in two parts. The first one runs on a laptop with
-Docker Compose, on a slice of the data, so that every step can be followed and every job exists in
-Python, R and Scala. The second one runs the same spatial join on Amazon EMR, straight from the
-public buckets of the data on S3, first for a whole country and then for the whole planet: about
-2,900 million observations of species against 555,000 municipalities, a size no single machine can
-handle.
+brings to a lakehouse with Apache Iceberg tables. It comes in two parts. The first one runs on a
+laptop with Docker Compose, on one region, so that every step can be followed, and every job exists
+in Python, R and Scala. The second one takes the same spatial join to Amazon EMR and runs it for the
+whole planet, straight from the public buckets of the data on S3: the 3,900 million records of GBIF
+against 555,000 localities, in under five minutes.
 
 ## The problem
 
@@ -60,13 +59,13 @@ files as they were downloaded, as external tables. Silver turns them into Iceber
 and with the same conventions for the spatial part. Gold holds the results of the spatial joins.
 Trino can query every layer with SQL, and has its own spatial functions.
 
-**The cloud part** runs the spatial join on Amazon EMR, reading GBIF and Overture straight from
-their public buckets on S3, with the infrastructure in Terraform and the job in Scala. The polygons
-no longer fit in the memory of every executor, so Sedona partitions both sides by location across
-the cluster. A whole country works today: Spain, 73 million observations against 8,655 polygons, in
-under four minutes. The whole planet is [what comes next](#next-the-whole-planet).
+**The cloud part** runs the spatial join on Amazon EMR, with the infrastructure in Terraform and
+the job in Scala. It reads GBIF and Overture where they are published, and writes the result as an
+Iceberg table that Athena can query once the cluster is gone. At that size the polygons no longer
+fit in the memory of every executor, so Sedona partitions both sides by location across the
+cluster. A country takes about a minute, and the planet four and a half.
 
-The setup favors being easy to read over being realistic, and it is not meant for production.
+The local part favors being easy to read over being realistic, and it is not meant for production.
 [This is not a production setup](#this-is-not-a-production-setup) explains what would change.
 
 ## Contents
@@ -133,16 +132,16 @@ public buckets of GBIF and Overture.
 ```
   ┌─────────────────────────────────┐        ┌─────────────────────────────────┐
   │ s3://gbif-open-data-us-east-1   │        │ s3://overturemaps-us-west-2     │
-  │ GBIF snapshot, 288 GB Parquet   │        │ Overture divisions, GeoParquet  │
+  │ GBIF snapshot, 303 GB Parquet   │        │ Overture divisions, GeoParquet  │
   └────────────────┬────────────────┘        └────────────────┬────────────────┘
                    │      bronze: external tables in Glue      │
                    ▼                                           ▼
   ┌──────────────────────────────────────────────────────────────────────────────┐
   │ Amazon EMR, in a VPC with one public subnet                                  │
   │                                                                              │
-  │   primary   m7g.xlarge, on demand      YARN, HDFS and the Spark driver       │
-  │   core      1 x c7g.4xlarge, on demand ┐ Spark executors, one task          │
-  │   task      3 x c7g.4xlarge, spot      ┘ per physical core                   │
+  │   primary   m7g.2xlarge, on demand     YARN, HDFS and the Spark driver       │
+  │   core      1 x c7g.8xlarge, on demand ┐ Spark executors, 192 cores, one     │
+  │   task      5 x c7g.8xlarge, spot      ┘ task per physical core              │
   └───────────────────────────────────────┬──────────────────────────────────────┘
                                           │ obs_municipality (Iceberg)
                                           ▼
@@ -163,7 +162,7 @@ public buckets of GBIF and Overture.
 | **Glue Data Catalog** | The catalog of the three layers, the same role the Hive Metastore has in the local part. |
 | **S3** | The lakehouse bucket, plus the public buckets the data is read from. |
 | **Athena** | Queries the tables with SQL once the cluster is gone, as Trino does locally. |
-| **Terraform** | Creates all of the above, with one file per service in `cloud-batch/terraform`. |
+| **Terraform** | Creates all of the above, with one file per service in `cloud/terraform`. |
 
 ### How geometries are stored
 
@@ -195,7 +194,7 @@ jars. You also need a free [GBIF account](https://www.gbif.org/user/profile), si
 the download of the occurrences on its side.
 
 ```bash
-git clone <this-repo> && cd sedona-demo/local-batch
+git clone <this-repo> && cd sedona-demo/local
 cp .env.example .env              # and fill in your GBIF account
 ./scripts/download-data.sh        # about 1.3 GB, and GBIF takes a while to prepare its file
 ./scripts/load-bronze.sh          # uploads data/raw to bronze and registers the tables
@@ -242,17 +241,20 @@ Hive Metastore are only reachable from inside the Docker network.
 ### On AWS
 
 The cloud part needs an AWS account, Terraform 1.9 or later, the AWS CLI and Docker, which builds
-the jar so you do not need a JDK or sbt. It runs in `us-east-1`, where GBIF keeps its copy, and a
-run for one country costs around two dollars.
+the jar so you do not need a JDK or sbt. It runs in `us-east-1`, where GBIF keeps its copy. The
+cluster costs about 5.5 dollars an hour while it is up, and the planet takes less than five minutes
+of it.
 
 ```bash
-cd sedona-demo/cloud-batch
+cd sedona-demo/cloud
 ./scripts/build.sh                                      # the jar of the Scala job
-terraform -chdir=terraform init
-terraform -chdir=terraform apply                        # about 10 minutes, mostly the cluster
+cd terraform
+terraform init
+terraform apply                                         # about 10 minutes, mostly the cluster
+cd ..
 ./scripts/submit.sh sedonademo.ObsMunicipality ES       # any country code, or world
 ./scripts/save-run.sh                                   # keeps the Spark event logs of the run
-terraform -chdir=terraform destroy
+cd terraform && terraform destroy
 ```
 
 [The cloud part](#the-cloud-part) goes through each step.
@@ -260,11 +262,11 @@ terraform -chdir=terraform destroy
 ## Walkthrough
 
 The steps below follow the data of the local part from the sources to the queries. Run them from
-`local-batch/`.
+`local/`.
 
 ### 1. Download the data
 
-[`scripts/download-data.sh`](local-batch/scripts/download-data.sh) downloads a slice of each
+[`scripts/download-data.sh`](local/scripts/download-data.sh) downloads a slice of each
 source into `data/raw`. Overture and the DEM are cut to the bounding box of Castilla-La Mancha,
 and the GBIF occurrences are filtered on GBIF's side by the region they fall in, through the
 [GBIF download API](https://techdocs.gbif.org/en/openapi/v1/occurrence#/Occurrence%20downloads).
@@ -286,9 +288,9 @@ cite the data.
 
 ### 2. Bronze
 
-[`scripts/load-bronze.sh`](local-batch/scripts/load-bronze.sh) uploads the files to RustFS, one
+[`scripts/load-bronze.sh`](local/scripts/load-bronze.sh) uploads the files to RustFS, one
 folder per source and partitioned by the date and hour they were downloaded, as a traditional
-bronze layer would. Then [`sql/lakehouse.sql`](local-batch/sql/lakehouse.sql) creates the three
+bronze layer would. Then [`sql/lakehouse.sql`](local/sql/lakehouse.sql) creates the three
 databases and the external tables, and registers their partitions.
 
 ```
@@ -302,7 +304,7 @@ Spark infers the partition columns from the folder names, so the SQL file does n
 
 ### 3. Silver
 
-[`bronze_to_silver`](local-batch/jobs/python/bronze_to_silver.py) reads the downloads of the last
+[`bronze_to_silver`](local/jobs/python/bronze_to_silver.py) reads the downloads of the last
 year from bronze, keeps the latest version of every record, and merges it into two Iceberg tables
 keyed by their id.
 
@@ -318,7 +320,7 @@ the DataFrame it comes from. The 5,972 files of bronze end up as 11 files and 97
 
 ### 4. Gold: observations per municipality
 
-[`silver_gold_municip`](local-batch/jobs/python/silver_gold_municip.py) joins every occurrence to
+[`silver_gold_municip`](local/jobs/python/silver_gold_municip.py) joins every occurrence to
 the municipality that contains it and counts observations and distinct species. It only keeps
 records of presence, identified down to species and placed within 1 km. The job prints its plan.
 
@@ -340,7 +342,7 @@ point against every polygon and took over ten minutes instead of one.
 
 ### 5. Gold: terrain per municipality
 
-[`silver_gold_terrain`](local-batch/jobs/python/silver_gold_terrain.py) reads the DEM tiles
+[`silver_gold_terrain`](local/jobs/python/silver_gold_terrain.py) reads the DEM tiles
 straight from bronze, since there is no standard yet for raster data in a lakehouse table. Each
 tile covers 1x1 degree with 3,600 x 3,600 pixels, so the job cuts it into pieces of 512 x 512 to
 spread the work and avoid going through pixels that no municipality needs. Every piece keeps its
@@ -401,8 +403,8 @@ The filter on `bbox` is what skips files. With it, `EXPLAIN ANALYZE` shows 3 fil
 
 ### 7. The same jobs in R and Scala
 
-Every job also exists in [`jobs/r`](local-batch/jobs/r), written with sparklyr and dplyr, and in
-[`jobs/scala`](local-batch/jobs/scala). All three versions build the same plan and write the
+Every job also exists in [`jobs/r`](local/jobs/r), written with sparklyr and dplyr, and in
+[`jobs/scala`](local/jobs/scala). All three versions build the same plan and write the
 same tables, so they can be mixed.
 
 ```bash
@@ -433,121 +435,156 @@ docker compose run --rm --service-ports spark spark-shell -i jobs/scala/lakehous
 ## The cloud part
 
 The local part proves the pipeline on 3.6 million points. The cloud part takes the spatial join to
-the size where it stops being possible on one machine. It lives in `cloud-batch/`, and only covers
-the observations per municipality, which is the join that grows with the data.
+the size where it stops being possible on one machine: every record of the monthly GBIF snapshot
+against every locality of Overture. It lives in `cloud/`, and only covers the observations per
+municipality, which is the join that grows with the data.
 
 | | Local | Cloud |
 |---|---|---|
-| Observations | 3.6 million (Castilla-La Mancha) | 2,874 million records in the GBIF snapshot on S3 (288 GB), 73 million of them in Spain |
-| Municipalities | 926 | 8,655 in Spain, about 555,000 in the world |
+| Observations | 3.6 million (Castilla-La Mancha) | 3,913 million records in the GBIF snapshot on S3 (303 GB) |
+| Municipalities | 926 | 554,885 localities |
 | Spatial join | `BroadcastIndexJoin`, the polygons fit in memory | `RangeJoin`, both sides partitioned by location |
-| Compute | Spark in local mode on a laptop | Amazon EMR, 64 Graviton cores |
+| Compute | Spark in local mode on a laptop | Amazon EMR, 192 Graviton cores |
 | Storage and catalog | RustFS and a Hive Metastore | S3 and the Glue Data Catalog, with external tables over the public buckets |
 | Language | Python, R and Scala | Scala, as a jar submitted to EMR |
 
-Checking every point against every municipality of the world would mean about
+Checking every record against every locality would mean about
 
-$$2.9 \times 10^9 \times 5.55 \times 10^5 \approx 1.6 \times 10^{15}$$
+$$3.9 \times 10^9 \times 5.5 \times 10^5 \approx 2.2 \times 10^{15}$$
 
 point-in-polygon tests. With Sedona's partitioning and index, each point is only checked against
 the one or two pieces of polygon around it.
 
 ### Running it
 
-Run the steps from `cloud-batch/`, with credentials for your AWS account in the environment.
+Run the steps from `cloud/`, with credentials for your AWS account in the environment.
 
-[`scripts/build.sh`](cloud-batch/scripts/build.sh) compiles the sbt project in
-[`jobs/`](cloud-batch/jobs) inside a Docker image with Java and sbt, and leaves the jar in
-`jobs/target/sedona-jobs.jar`. Spark and Sedona are marked as provided, since the cluster brings
-them, so the jar only holds the classes of the job.
+[`scripts/build.sh`](cloud/scripts/build.sh) compiles the sbt project in [`jobs/`](cloud/jobs)
+inside a Docker image with Java and sbt. Spark and Sedona are marked as provided, since the cluster
+brings them, so the jar only holds the classes of the job.
 
 `terraform apply` creates the whole stack, with one file per service in
-[`terraform/`](cloud-batch/terraform):
+[`terraform/`](cloud/terraform). There is a VPC with one public subnet and a gateway endpoint for
+S3, the lakehouse bucket split into `data/`, `code/` and `temp/` (whatever is under `temp/` expires
+after a few weeks), the three databases in Glue with the bronze tables pointing at the public
+buckets, an Athena workgroup that refuses queries over 10 GB, and two IAM roles, one for the EMR
+service and one for the nodes, which can only touch the lakehouse bucket, the public buckets and
+Glue. Last comes the cluster, whose task nodes are spot instances capped at their on-demand price,
+which Terraform reads from the AWS Pricing API. It terminates itself after 30 minutes without work.
 
-- A VPC with one public subnet and a gateway endpoint for S3, so the cluster reads the data
-  without going through the internet.
-- The lakehouse bucket, split into `data/`, `code/` and `temp/`. Everything under `temp/` expires
-  after 15 or 30 days.
-- The `bronze`, `silver` and `gold` databases in Glue. Bronze holds external tables over the
-  public buckets, with every column declared, and gold the Iceberg table of the results.
-- An Athena workgroup that keeps its results under `temp/athena/` and stops any query that would
-  scan more than 10 GB.
-- An IAM role for the EMR service and another one for the nodes, which can only touch the
-  lakehouse bucket, the two public buckets and the Glue catalog.
-- The EMR cluster, with Spark configured for Sedona, Iceberg and Glue. The task nodes are spot
-  instances, and Terraform reads their on-demand price from the AWS Pricing API to use it as the
-  highest price to pay. The cluster terminates itself after 30 minutes without work.
-
-[`scripts/submit.sh`](cloud-batch/scripts/submit.sh) uploads the jar to `code/jars/` and adds a
-step to the cluster that runs `spark-submit` with the class and its arguments. The only argument
-of the job is the scope, a country code such as `ES` or `world`. The driver runs on the primary
-node, so its output ends up in the log of the step, under `temp/logs/<cluster>/steps/`.
-
-When the step is done, the results can be queried from Athena, in the `geospatial-lakehouse`
-workgroup:
+[`scripts/submit.sh`](cloud/scripts/submit.sh) uploads the jar and adds a step to the cluster that
+runs `spark-submit`. The only argument of the job is the scope, a country code such as `ES` or
+`world`, and the result replaces the rows of that scope in `gold.obs_municipality`, so a country can
+be run again without touching the others. The driver runs on the primary node, so its output ends
+up in the log of the step, under `temp/logs/<cluster>/steps/`. The results can then be queried from
+Athena, in the `geospatial-lakehouse` workgroup:
 
 ```sql
-SELECT name, region, observations, species
+SELECT name, country, observations, species
 FROM gold.obs_municipality
-WHERE scope = 'es'
+WHERE scope = 'world'
 ORDER BY species DESC
 LIMIT 5;
 ```
 
-`terraform destroy` removes everything, the bucket and its contents included, so run
-[`scripts/save-run.sh`](cloud-batch/scripts/save-run.sh) before if you want to look at the run
-later. Terminating the cluster from the console also stops the costs, and the next
-`terraform apply` creates a new one.
+Terminating the cluster from the console stops the costs and leaves the bucket, the tables and the
+logs where they are, and the next `terraform apply` creates a new one. `terraform destroy` removes
+the bucket as well, so run [`scripts/save-run.sh`](cloud/scripts/save-run.sh) before it if you want
+to look at the run later.
 
-### The job
+### How the job works
 
-[`ObsMunicipality.scala`](cloud-batch/jobs/src/main/scala/sedonademo/ObsMunicipality.scala) does
-the same as `silver_gold_municip` in the local part, but straight from the bronze tables. It keeps
-records of presence, identified down to species and placed within 1 km, turns the coordinates into
-points and the WKB of Overture into polygons, joins them with `ST_Contains`, and counts
-observations and distinct species per municipality. Only the id of the municipality goes through
-the spatial join. The name, the region and the outline come back afterwards with a plain join,
-instead of being dragged through the partitioning. The result replaces the rows of its scope in
-`gold.obs_municipality`, so a country can be run again without touching the others.
+[`ObsMunicipality.scala`](cloud/jobs/src/main/scala/sedonademo/ObsMunicipality.scala) does the
+same as `silver_gold_municip` in the local part, but straight from the bronze tables, and it
+needed three ideas to get there at the size of the planet.
 
-The cloud part only has this job in Scala, to keep it simple: a single jar that EMR runs as a step,
-with nothing to install on the cluster. The same job could be written in Python or R, like the jobs
-of the local part, by installing their packages on the nodes when the cluster starts.
+**The observations are grouped first.** GBIF has a lot of records in exactly the same place:
+hotspots of eBird visited every day, coordinates rounded to the center of a region, the same point
+used for a whole collection. In a sample of 2% of the snapshot, 1,604 coordinates had 2,000 records
+or more, and the busiest one had 134,927, which would be close to seven million in the whole
+snapshot. That is a problem for Sedona, as explained below, so the job counts the observations by
+coordinate and species before the join, which leaves 799 million rows, and a coordinate is never
+repeated more times than it has species.
 
-Two details decide how fast it is.
+**The grid is drawn from the points.** A `RangeJoin` splits the map into cells, drawn from a sample
+of one side of the join so that every cell gets about the same number of its elements. Every cell
+then builds an R-tree over the other side and checks its points against it. The job keeps the
+polygons on the left, which is the side that gets indexed, and sets
+`spark.sedona.join.spatitionside` to `right`, so that the cells follow where the observations are.
+Left alone, Sedona would make as many cells as partitions the points arrive in, which has nothing to
+do with how many points there are, so the job counts the rows and asks for one cell every 20,000.
 
-**Which side draws the grid.** A `RangeJoin` splits the map into cells from a sample of one side of
-the join, the left one by default, so that every cell holds about the same number of its
-elements. Then every cell builds an R-tree, also over the left side, and checks the other side
-against it. The job keeps the polygons on the left, so they are the ones indexed, and sets
-`spark.sedona.join.spatitionside` to `right`, so the cells follow where the observations are. Drawn
-from the polygons, the cells would follow where the municipalities are instead, and the few with
-most of the observations would take far longer than the rest.
+**The polygons are cut into pieces.** To check whether a point is inside a polygon, the `RangeJoin`
+uses the plain `contains` of JTS, which walks the whole outline. Some coastal localities have tens
+of thousands of vertices, 77,866 in the case of Alt Empordà. `ST_SubDivideExplode` cuts every
+polygon in two, again and again, along a straight line through the middle of its longer side, until
+no piece has more than 256 vertices. Every piece keeps the id of its locality. Cutting a big polygon
+is expensive, and the few tasks that read Overture would have to cut all the polygons in their part
+of the files, so the polygons are spread over 1,000 partitions first.
 
-**Cutting the polygons.** To check whether a point is inside a polygon, the `RangeJoin` uses the
-plain `contains` of JTS, which walks the whole outline (the broadcast join prepares the polygons
-first, this one does not). Some coastal localities have tens of thousands of vertices, 77,866 in
-the case of Alt Empordà. `ST_SubDivideExplode` cuts every polygon into pieces of 256 vertices at
-most, each one keeping the id of its municipality, so Spain goes from 8,655 polygons to 30,877
-pieces. A point that falls exactly on one of the cuts belongs to no piece, which with real
-coordinates does not happen in practice.
+Only the id of the locality goes through the spatial join. The name, the country and the outline
+come back afterwards with a plain join, instead of being dragged through the partitioning. The job
+only exists in Scala, to keep the cloud part simple: a single jar that EMR runs as a step, with
+nothing to install on the cluster. It could be written in Python or R like the jobs of the local
+part, by installing their packages on the nodes when the cluster starts.
 
-### A whole country: Spain
+### The whole planet
 
 | | |
 |---|---|
-| Records read from GBIF | 2,874 million, the whole snapshot |
-| Observations after the filters | 72.9 million, 70.6 million of them with coordinates |
-| Polygons | 8,655 localities, cut into 30,877 pieces |
-| Cells of the join | 3,499, with about 20,000 points and 17 pieces each |
-| Spatial join | 46 seconds, the median task 0.7 s and the slowest 16.7 s |
-| Whole step | 3 minutes and 38 seconds |
-| Result | 8,528 rows, 51 MB in 25 Parquet files |
+| GBIF | 10,448 Parquet files, 3,913 million records |
+| Read from S3 | 93 GB, since only 6 of the 50 columns of GBIF are needed |
+| Into the spatial join | 799 million rows of coordinate and species |
+| Overture | 1.07 million areas, 554,885 of them localities, cut into 1.65 million pieces |
+| Cells of the join | 57,346 |
+| Result | 368,576 localities in 222 countries and territories, with 1,868 million observations |
 
-GBIF is read three times in every run. Sedona goes through the points once to count them and find
-their bounds, once to take the sample of the grid, and once to send each point to its cell, and
-nothing keeps them in between. Filtering by country does not save any reading either, because the
-snapshot is not sorted by country, so reading costs the same for Spain as for the whole planet.
+| Step | Time |
+|---|---|
+| Read GBIF and group the observations | 23 s |
+| Count the rows to size the grid | 12 s |
+| Read Overture | 12 s |
+| Sample the points and draw the grid | 14 s |
+| Send points and pieces to their cells | 30 s |
+| Spatial join | 2 min 30 s |
+| Aggregate and write to Iceberg | 13 s |
+| **Total** | **4 min 16 s**, and 4 min 36 s with the start of the application |
+
+The tasks of the spatial join took 0.3 seconds in the median and 3.1 seconds the slowest, so no
+cell held the rest back. Altogether the tasks added up to 10 hours of work on the 192 cores, 6.8 of
+them on the CPU and the rest waiting for S3 and the shuffles. The cluster costs about 5.5 dollars an
+hour, so the run itself was worth some 40 cents.
+
+What comes out says as much about who records as about where species live. These are the
+localities with the most species:
+
+```
+ name       | country | species | observations
+------------+---------+---------+--------------
+ Sydney     | AU      |   29032 |      8152842
+ Brisbane   | AU      |   19760 |      7763015
+ Melbourne  | AU      |   18056 |     11563815
+ Coral Sea  | AU      |   16506 |       852048
+ Helsinki   | FI      |   14677 |      1339288
+ New York   | US      |   14675 |     14869539
+```
+
+Part of it is the size of the localities, since Sydney covers 4,800 km² in Overture against 1,217
+for New York, and part how much people record in each country.
+
+The first try at the planet, without grouping the observations, never got past the grid. Sedona
+brought 30 million points to the driver to draw it, and the driver was still alone with them after
+nine minutes, while the executors sat idle. As far as I can tell from its code and from the data,
+this is why: its KDB-tree splits a cell in two when it gets too full, and a cell full of identical
+points cannot be split, so Sedona tries again, sorting the whole cell, with every new point that
+lands in it. With the observations grouped, the sample was
+8 million points and the grid was ready in 8 seconds.
+
+Spain, on the same cluster, takes 39 seconds of computing out of 65. The Parquet reader skips the
+groups of rows that cannot hold the country, so it reads 3,026 million records instead of 3,913.
+They become 26.7 million rows of coordinate and species, and 8,655 localities are cut into 30,877
+pieces. The spatial join takes 8 seconds over 1,924 cells, and 8,530 localities come out with 108.9
+million observations.
 
 ### Looking at a run afterwards
 
@@ -557,30 +594,14 @@ it goes. `save-run.sh` copies them from the HDFS of the cluster to the bucket an
 local part opens every run in `runs/events/`:
 
 ```bash
-cd ../local-batch
+cd ../local
 docker compose up -d spark-history                      # http://localhost:18080
 ```
 
-Its SQL tab shows the plan with the rows that went through each step, the Stages tab how long every
-task took, and the Jobs tab the three reads of GBIF, under the names `aggregate at
-SpatialRDD.java`, `collect at SpatialRDD.java` and `flatMapToPair at SpatialRDD.java`.
-
-### Next: the whole planet
-
-The planet has between 30 and 40 times more observations than Spain, depending on how many pass
-the filters, and about 60 times more polygons. Before running it, these are the changes I expect
-to make:
-
-- **A bigger limit for the sample.** Sedona brings 1% of the points to the driver to draw the grid,
-  around 30 MB for Spain but about 1 GB for the planet, which is the default
-  `spark.driver.maxResultSize`. It needs a higher limit and a primary node with more memory.
-- **More cells.** The number of cells comes from the number of files read on the side that draws
-  the grid, so the planet would get the same 3,500 cells as Spain, each with far more points.
-  `spark.sedona.join.numpartition` sets it by hand.
-- **More nodes.** At the speed of Spain, 64 cores would need around half an hour for the join.
-  Twice the nodes take half the time for about the same money.
-- **One read less.** `spark.sedona.join.approxcount` and `spark.sedona.join.boundary` give Sedona
-  the count and the bounds of the points, so it can skip the first read of GBIF.
+The SQL tab shows the plan with the rows that went through each step, and the Stages tab how long
+every task took. In the Jobs tab, the work of Sedona appears under the names of its own code,
+`aggregate at SpatialRDD.java` to count the points, `collect at SpatialRDD.java` to sample them and
+`flatMapToPair at SpatialRDD.java` to send them to their cells.
 
 ## The data
 
@@ -594,6 +615,12 @@ The cloud part reads the monthly snapshot of GBIF from `s3://gbif-open-data-us-e
 holds the records under CC0 and CC BY, and the release of Overture from
 `s3://overturemaps-us-west-2`. The versions are set by `gbif_snapshot` and `overture_release` in
 the Terraform variables, since Overture only keeps its latest releases.
+
+A snapshot with a date is not necessarily frozen. The one of 1 October 2026 was published on the
+5th with 9,926 files, and on the 23rd GBIF added the 522 that were missing, 15 GB or about 5% of
+the records. Runs of Spain before and after that day gave 102.8 and 108.9 million observations.
+Spark records the number of files it read in the plan of every run, and for results that must be
+reproducible it is safer to keep that number, or a copy of the snapshot.
 
 Overture and the DEM are read from their public buckets on AWS, and the download needs no AWS
 account. If you show results built on the GBIF records, cite the DOI of your download, as asked in
@@ -685,7 +712,17 @@ against the code or reproduced it.
   data that tells them apart. 361 of the 8,655 localities contain others, so an observation in
   Figueres counts for Figueres and for Alt Empordà, and the observations of the result add up to
   more than the points that went in. The comarcas are also the first rows when sorting by
-  observations.
+  observations, and other countries have similar cases.
+- **Sedona's grid cannot split identical points.** Its KDB-tree sorts a full cell again with every
+  new point that lands in it when the cell cannot be split, which with the repeated coordinates of
+  GBIF kept the driver busy for minutes. Grouping the observations by coordinate first avoids it.
+- **`spark.sedona.join.approxcount` empties the join.** In Sedona 1.9.1 it makes the `RangeJoin`
+  skip counting the points, but the count it gives is never passed on, and without a count the
+  points are not partitioned and the join returns no rows. I found it reading the code, not running
+  it.
+- **Points on the cuts of a polygon are lost.** `ST_Contains` does not include the boundary, so a
+  point exactly on the line between two pieces of `ST_SubDivideExplode` belongs to neither. In
+  Spain it happened to 68 observations out of 102.8 million.
 - **The `RangeJoin` has no metrics.** Its box in the SQL tab of the Spark UI stays empty, so the
   number of pairs that come out of the join is only visible in the result.
 - **Terraform cannot turn on two features of EMR yet**: sending the logs to CloudWatch, which would
@@ -701,31 +738,34 @@ against the code or reproduced it.
 
 ## This is not a production setup
 
-Everything here is tuned so that a laptop can run it and a person can follow it.
+The local part is tuned so that a laptop can run it and a person can follow it.
 
-- **A slice of the data.** One region, so that every job runs in a minute or two. The whole
-  planet is what [the cloud part](#the-cloud-part) is for.
+- **A slice of the data.** One region, so that every job runs in a minute or two.
 - **Spark in local mode.** Every job runs in a single JVM on the cores of the laptop.
 - **A lookback window of one year.** `bronze_to_silver` only reads the downloads of the last 365
   days. A real pipeline would read only what arrived since the last run.
 - **Throwaway state.** The Hive Metastore keeps its catalog in an embedded Derby database inside
   its container. `docker compose down` forgets the tables while their files stay in RustFS, and
-  `docker compose down -v` removes the files too.
+  `docker compose down -v` removes the files too. After a `down`, `load-bronze.sh` and the jobs
+  register everything again.
 - **No security.** There is no TLS and no authentication between the services, and the RustFS
   credentials are the same for everything.
-- **A cluster per run.** The EMR cluster lives in a public subnet of a single availability zone
-  and is meant to be destroyed after each run, together with the bucket and everything in it.
+
+The cloud part is much closer to how it would run for real: the data stays where it is published,
+the infrastructure is code, the nodes can only touch what they need, and the cluster only lives
+for the run. A few shortcuts are left on purpose. Terraform keeps its state in a local file, the
+cluster runs in a public subnet, and `terraform destroy` takes the bucket and the results with it.
 
 ## Repository layout
 
-Each folder of `local-batch/` holds everything its containers need. In both parts, `scripts/` holds
+Each folder of `local/` holds everything its containers need. In both parts, `scripts/` holds
 what you run from your own machine.
 
 ```
 .
 ├── README.md
 ├── docs/images/              logos used in this README
-├── cloud-batch/
+├── cloud/
 │   ├── terraform/            VPC, bucket, Glue, Athena, IAM and the EMR cluster, one file per service
 │   ├── jobs/                 sbt project with the Scala job, ObsMunicipality
 │   ├── scripts/
@@ -733,14 +773,14 @@ what you run from your own machine.
 │   │   ├── submit.sh         uploads the jar and runs one of its classes as an EMR step
 │   │   └── save-run.sh       downloads the Spark event logs and the EMR logs of a run
 │   └── runs/                 the saved runs, not committed
-└── local-batch/
+└── local/
     ├── docker-compose.yml    services, ports, volumes, dependencies
     ├── .env.example          GBIF account and RustFS credentials, copied to .env
     ├── rustfs/               S3 storage settings and the script that creates the bucket
     ├── metastore/            Hive Metastore image with S3A, and its core-site.xml
     ├── spark/                Spark image (Sedona, Iceberg, S3A, R), spark-defaults.conf, logging
     ├── trino/                Trino catalogs for Iceberg and Hive
-    ├── spark-history/        settings of the history server that opens cloud-batch/runs
+    ├── spark-history/        settings of the history server that opens cloud/runs
     ├── sql/lakehouse.sql     databases and external tables of bronze
     ├── scripts/
     │   ├── download-data.sh  downloads the slice of every source into data/raw
@@ -757,13 +797,14 @@ These are the settings you are most likely to play with.
 
 | Setting | Where | Default |
 |---|---|---|
-| Region of the data | `BBOX` and `GADM_GID` in [`download-data.sh`](local-batch/scripts/download-data.sh), and the region code in the gold jobs | Castilla-La Mancha |
+| Region of the data | `BBOX` and `GADM_GID` in [`download-data.sh`](local/scripts/download-data.sh), and the region code in the gold jobs | Castilla-La Mancha |
 | Lookback window of silver | `LOOKBACK_DAYS` in `bronze_to_silver` | 365 days |
 | Size of the raster pieces | `RS_TileExplode` in `silver_gold_terrain` | 512 x 512 pixels |
-| Spark memory | `spark.driver.memory` in [`spark-defaults.conf`](local-batch/spark/spark-defaults.conf), and `connect()` in [`jobs/r/lakehouse.R`](local-batch/jobs/r/lakehouse.R) | 6 GB |
-| Size of the EMR cluster | `primary_instance_type`, `worker_instance_type`, `core_count` and `task_count` in [`variables.tf`](cloud-batch/terraform/variables.tf) | `m7g.xlarge`, and 1 + 3 `c7g.4xlarge` |
+| Spark memory | `spark.driver.memory` in [`spark-defaults.conf`](local/spark/spark-defaults.conf), and `connect()` in [`jobs/r/lakehouse.R`](local/jobs/r/lakehouse.R) | 6 GB |
+| Size of the EMR cluster | `primary_instance_type`, `worker_instance_type`, `core_count` and `task_count` in [`variables.tf`](cloud/terraform/variables.tf) | `m7g.2xlarge`, and 1 + 5 `c7g.8xlarge` |
 | Spot or on demand | `task_on_spot` in `variables.tf` | spot |
 | Size of the polygon pieces | `ST_SubDivideExplode` in `ObsMunicipality.scala` | 256 vertices |
+| Rows per cell of the spatial join | `PointsPerCell` in `ObsMunicipality.scala` | 20,000 |
 
 ## Troubleshooting
 
@@ -790,6 +831,10 @@ come from IAM taking a few seconds to spread, and running `apply` again solves i
 **The task nodes never start.** There may be no spot capacity of that type at the time. Set
 `task_on_spot` to `false` and run `terraform apply` again.
 
+**The driver is stuck after `collect at SpatialRDD`, with the executors idle.** That is Sedona
+drawing its grid alone on the driver. If it takes more than a minute, the side that draws the grid
+probably has many identical points, and grouping them before the join solves it.
+
 **The Spark History Server of the EMR console fails while a job runs.** It reads the event log
 while the driver is still writing it. The log of the step in S3, updated every few minutes, and the
 history server once the job is done are more reliable.
@@ -804,7 +849,7 @@ docker compose stop       # pause, keeping the state (resume with: docker compos
 docker compose down -v    # remove everything, including the lakehouse in RustFS
 ```
 
-In the cloud part, `terraform -chdir=terraform destroy` removes the cluster, the bucket and
+In the cloud part, `terraform destroy` from `cloud/terraform` removes the cluster, the bucket and
 everything else it created.
 
 ## Contributing

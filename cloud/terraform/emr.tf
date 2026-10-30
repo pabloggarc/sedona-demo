@@ -45,7 +45,8 @@ resource "aws_emr_cluster" "sedona" {
         "spark.sql.catalog.spark_catalog.catalog-impl" = "org.apache.iceberg.aws.glue.GlueCatalog"
         "spark.sql.catalog.spark_catalog.io-impl"      = "org.apache.iceberg.aws.s3.S3FileIO"
         "spark.sql.catalog.spark_catalog.warehouse"    = "${local.data_uri}/"
-        "spark.driver.memory"                          = var.driver_memory
+        "spark.driver.memory"                          = var.driver_memory # The driver runs on the primary node, since jobs are submitted in client mode
+        "spark.driver.maxResultSize"                   = "4g"              # Sedona brings 1% of the points to the driver to draw its grid, about 1 GB for the planet
       }
     },
     {

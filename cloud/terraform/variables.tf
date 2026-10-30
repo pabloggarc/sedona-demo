@@ -43,13 +43,13 @@ variable "release_label" {
 variable "primary_instance_type" {
   description = "Instance type of the primary node, which runs YARN, HDFS and the Spark driver"
   type        = string
-  default     = "m7g.xlarge"
+  default     = "m7g.2xlarge"
 }
 
 variable "worker_instance_type" {
   description = "Instance type of the core and task nodes, which run the Spark executors"
   type        = string
-  default     = "c7g.4xlarge"
+  default     = "c7g.8xlarge"
 }
 
 variable "core_count" {
@@ -61,7 +61,7 @@ variable "core_count" {
 variable "task_count" {
   description = "Number of task nodes"
   type        = number
-  default     = 3
+  default     = 5
 }
 
 variable "task_on_spot" {
@@ -79,7 +79,7 @@ variable "idle_timeout_seconds" {
 variable "driver_memory" {
   description = "Memory of the Spark driver, which runs on the primary node"
   type        = string
-  default     = "8g"
+  default     = "16g"
 }
 
 variable "network_tag" {

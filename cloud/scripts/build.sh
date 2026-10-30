@@ -8,5 +8,3 @@ docker run --rm \
   -v sedona-sbt-cache:/root/.cache \
   sbtscala/scala-sbt:eclipse-temurin-17.0.15_6_1.11.7_2.13.17 \
   sbt -batch scalafmtAll clean package
-
-ls -l target/sedona-jobs.jar
